@@ -1,4 +1,4 @@
-pytorch-pretrained-bert
+transformers
 torch
 scikit-learn
 nltk

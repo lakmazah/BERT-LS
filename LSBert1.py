@@ -11,8 +11,7 @@ import math
 import sys
 import re
 
-from pytorch_pretrained_bert.tokenization import BertTokenizer
-from pytorch_pretrained_bert.modeling import BertModel, BertForMaskedLM
+from transformers import BertModel, BertForMaskedLM, BertTokenizer
 
 from sklearn.metrics.pairwise import cosine_similarity as cosine
 
@@ -28,9 +27,6 @@ from nltk.stem import PorterStemmer
 
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
-
-
-from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE, WEIGHTS_NAME, CONFIG_NAME
 
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -439,7 +435,8 @@ def get_score(sentence,tokenizer,maskedLM):
         #print(mask_input)
         mask_input = mask_input.to('cuda')
         with torch.no_grad():
-            att, pre_word =maskedLM(mask_input)
+            output = maskedLM(mask_input)
+            pre_word = output.logits
         word_loss = cross_entropy_word(pre_word[0].cpu().numpy(),i,input_ids[i])
         sentence_loss += word_loss
         #print(word_loss)
@@ -712,10 +709,10 @@ def main():
                         required=True,
                         help="The path of word frequency.")
     ## Other parameters
-    parser.add_argument("--cache_dir",
-                        default="",
-                        type=str,
-                        help="Where do you want to store the pre-trained models downloaded from s3")
+    parser.add_argument('--max_examples',
+                    type=int,
+                    default=None,
+                    help="Maximum number of examples to evaluate")
 
     parser.add_argument("--max_seq_length",
                         default=250,
@@ -815,8 +812,23 @@ def main():
     
 
     # Prepare model
-    cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed_{}'.format(args.local_rank))
-    model = BertForMaskedLM.from_pretrained(args.bert_model,output_attentions=True,cache_dir=cache_dir)
+    cache_dir = None
+    model = BertForMaskedLM.from_pretrained(args.bert_model,output_attentions=True, attn_implementation="eager")
+
+    try:
+    # Force load from the official Hugging Face model hub
+      model = BertForMaskedLM.from_pretrained(
+          args.bert_model,
+          output_attentions=True,
+          attn_implementation="eager"
+      )
+    except Exception as e:
+        print(f"Failed to load model from Hugging Face: {args.bert_model}")
+        print(f"Error: {e}")
+        print("Make sure you're using a valid model name like 'bert-base-uncased'")
+        sys.exit(1)
+
+
     if args.fp16:
         model.half()
     model.to(device)
@@ -864,12 +876,12 @@ def main():
       
         eval_size = len(eval_examples)
 
-        for i in range(eval_size):
+        max_eval = args.max_examples if args.max_examples is not None else eval_size
 
-            print('Sentence {} rankings: '.format(i))
-            #output_sr_file.write(str(i))
-            #output_sr_file.write(' sentence: ')
-            #output_sr_file.write('\n')
+        for i in range(max_eval):
+
+            if i%50 == 0:
+                print(i)
             tokens, words, position = convert_sentence_to_token(eval_examples[i], args.max_seq_length, tokenizer)
 
             assert len(words)==len(position)
@@ -899,8 +911,8 @@ def main():
 
                 # Predict all tokens
             with torch.no_grad():
-                all_attentions,prediction_scores = model(tokens_tensor, token_type_ids,attention_mask)
-
+                outputs = model(input_ids=tokens_tensor, token_type_ids=token_type_ids, attention_mask=attention_mask)
+                prediction_scores = outputs.logits
 
             
             if isinstance(mask_position,list):
@@ -919,9 +931,15 @@ def main():
 
 
             substitution_words.append(pre_word)
+
+            output_sr_file.write(f"Sentence {i} rankings:\n")
+            output_sr_file.write(f"Mask word: {mask_words[i]}\n")
+            output_sr_file.write(f"Candidate substitutions: {candidate_words}\n")
+            output_sr_file.write(f"Chosen substitution: {pre_word}\n")
+            output_sr_file.write("-" * 40 + "\n")
         
         
-        potential,precision,recall,F_score=evaulation_SS_scores(SS, mask_labels)
+        potential, precision, recall, F_score = evaulation_SS_scores(SS, mask_labels[:max_eval])
         print("The score of evaluation for substitution selection")
         output_sr_file.write(str(args.num_selections))
         output_sr_file.write('\t')
@@ -945,7 +963,7 @@ def main():
         output_sr_file.write(str(changed_proportion))
         output_sr_file.write('\n')
 
-        #output_sr_file.close()
+        output_sr_file.close()
 
 if __name__ == "__main__":
     main()
